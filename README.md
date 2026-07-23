@@ -1,0 +1,115 @@
+# Lightroom MIDI Bridge
+
+Control Adobe Lightroom CC with any MIDI controller — knobs, faders, buttons — via Lightroom's built-in external controller WebSocket API.
+
+## Prerequisites
+
+- macOS
+- Adobe Lightroom CC (cloud version, **not** Classic)
+- Python 3.10+
+- A MIDI controller connected via USB or Bluetooth
+
+## Enable the WebSocket server in Lightroom
+
+This is a one-time step:
+
+1. Open **Adobe Lightroom**
+2. Go to **Lightroom → Preferences → Interface**
+3. Tick **"Enable external controllers"**
+4. **Restart Lightroom**
+
+Once enabled, Lightroom starts a local WebSocket server (default port 7682) and writes its active port to:
+
+```
+~/Library/Application Support/Adobe/Lightroom CC/Connections/connections.json
+```
+
+## Installation
+
+```bash
+git clone <repo>
+cd lightroom-control
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+## Usage
+
+### 1 — Interactive setup (run once, or whenever you want to change mappings)
+
+```bash
+.venv/bin/python main.py --configure
+```
+
+The setup wizard will:
+
+1. List your available MIDI input ports — pick one
+2. Connect to Lightroom (accept the pairing dialog that appears)
+3. Show current mappings (if any)
+4. **Learn loop:** move or press a control on your device → it detects the CC/note/channel automatically → search for the Lightroom target by name or category and select it → repeat for as many controls as you like
+5. Press **Ctrl+C** (or answer "n" to "Map another?") to save and exit
+
+Mappings are saved to `mappings.json` in the project folder.
+
+### 2 — Run the bridge
+
+```bash
+.venv/bin/python main.py
+```
+
+The bridge loads `mappings.json`, connects to Lightroom, and translates MIDI messages to Lightroom API calls in real time. Press **Ctrl+C** to stop.
+
+### Options
+
+```
+--configure / -c    Run interactive setup
+--port PORT / -p    Override the Lightroom WebSocket port (default: read from connections.json)
+```
+
+## Controllable parameters
+
+### Develop sliders
+
+| Category | Parameters |
+|---|---|
+| **Light** | Exposure, Contrast, Highlights, Shadows, Whites, Blacks, Texture, Clarity, Dehaze |
+| **Color** | Vibrance, Saturation, Temperature, Tint, Shadow Tint |
+| **Detail** | Sharpening Amount/Radius/Detail/Masking, Luminance NR, Color NR |
+| **Effects** | Vignette Amount/Midpoint/Feather, Grain Amount/Size/Roughness |
+
+### Actions (triggered by buttons on press / note-on)
+
+| Category | Actions |
+|---|---|
+| Navigation | Next / Previous Photo, Go Back / Forward |
+| Editing | Auto Tone, Reset All Edits, Undo, Redo, Toggle B&W, Copy/Paste Edit Settings |
+| View | Zoom In/Out, Zoom to Fit, Zoom 1:1, Toggle Zoom |
+| Flag & Rating | Pick, Reject, Unflag, Toggle Pick/Reject, Rating +1/−1, Set Rating 0–5 |
+| Color Label | Red, Yellow, Green, Blue, Purple, None |
+
+## Control modes
+
+**Absolute** — for faders and potentiometers: CC value 0→127 maps linearly across the parameter's full range, with value pickup (soft takeover) so the Lightroom slider does not jump until the hardware control crosses the current Lightroom value.
+
+**Relative** — for endless encoders: uses signed-bit encoding (values 1–63 = clockwise / increase, 65–127 = counter-clockwise / decrease). Most modern encoders (Arturia, Korg nanoKONTROL, Behringer X-TOUCH, etc.) use this encoding. Sensitivity is configurable per control.
+
+## How it works
+
+Lightroom CC exposes a JSON-over-WebSocket API documented inside its own app bundle (`LrAppControllerDocumentation.lua`). When "Enable external controllers" is on, it listens at `ws://127.0.0.1:7682` (by default). This bridge:
+
+1. Pairs with Lightroom via the `register` handshake
+2. Subscribes to all parameter changes to keep a local value cache (needed for relative encoder mode)
+3. On each MIDI message, looks up the mapping and calls `setValue(paramName, value)` or the relevant action method
+
+## Project structure
+
+```
+lightroom-control/
+├── main.py          Entry point and argument parsing
+├── lr_client.py     Async WebSocket client for the Lightroom API
+├── configure.py     Interactive mapping setup
+├── bridge.py        Real-time MIDI → Lightroom bridge
+├── params.py        Parameter and action catalogue with ranges
+├── requirements.txt
+└── mappings.json    Your saved mappings (created by --configure)
+```
