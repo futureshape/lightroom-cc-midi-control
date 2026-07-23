@@ -53,6 +53,24 @@ def _midi_key(event: dict) -> str:
     return f"other:{event.get('raw', '')}"
 
 
+def _related_midi_keys(event: dict) -> set[str]:
+    """Return all MIDI keys that may represent the same physical control."""
+    key = _midi_key(event)
+    keys = {key}
+
+    if event["type"] != "cc":
+        return keys
+
+    cc = event["cc"]
+    channel = event["channel"]
+    if 0 <= cc <= 31:
+        keys.add(f"cc:{channel}:{cc + 32}")
+    elif 32 <= cc <= 63:
+        keys.add(f"cc:{channel}:{cc - 32}")
+
+    return keys
+
+
 def _describe_midi(event: dict) -> str:
     t = event["type"]
     if t == "cc":
@@ -130,9 +148,14 @@ class MidiWatcher:
             except asyncio.TimeoutError:
                 break
 
-    async def next_event(self, timeout: float = 30.0) -> Optional[dict]:
+    async def next_event(
+        self,
+        timeout: float = 30.0,
+        ignored_keys: Optional[set[str]] = None,
+    ) -> Optional[dict]:
         """Wait for the next meaningful MIDI message and return a parsed event."""
         deadline = asyncio.get_running_loop().time() + timeout
+        ignored_keys = ignored_keys or set()
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -142,7 +165,11 @@ class MidiWatcher:
             except asyncio.TimeoutError:
                 return None
             event = _parse_raw(raw)
-            if event and event["type"] != "note_off":
+            if not event or event["type"] == "note_off":
+                continue
+            if _related_midi_keys(event) & ignored_keys:
+                continue
+            if event:
                 return event
 
     def close(self):
@@ -436,6 +463,7 @@ async def run_configure(lr_port: Optional[int] = None):
     watcher = MidiWatcher(midi_port)
     watcher.open()
     watcher.flush_pending()
+    ignored_keys: set[str] = set()
 
     try:
         while True:
@@ -445,7 +473,7 @@ async def run_configure(lr_port: Optional[int] = None):
             )
 
             try:
-                event = await watcher.next_event(timeout=30.0)
+                event = await watcher.next_event(timeout=30.0, ignored_keys=ignored_keys)
             except KeyboardInterrupt:
                 break
 
@@ -458,6 +486,7 @@ async def run_configure(lr_port: Optional[int] = None):
                 continue
 
             key  = _midi_key(event)
+            related_keys = _related_midi_keys(event)
             desc = _describe_midi(event)
             console.print(f"\n[green]▶  Detected:[/green] [bold]{desc}[/bold]", end="")
 
@@ -471,6 +500,7 @@ async def run_configure(lr_port: Optional[int] = None):
                     if not Confirm.ask("\nMap another control?", default=True):
                         break
                     watcher.flush_pending()
+                    ignored_keys = set(related_keys)
                     continue
                 config["mappings"] = [
                     m for m in config["mappings"] if m.get("midi_key") != key
@@ -506,6 +536,7 @@ async def run_configure(lr_port: Optional[int] = None):
                 break
 
             watcher.flush_pending()
+            ignored_keys = set(related_keys)
 
     except KeyboardInterrupt:
         pass
