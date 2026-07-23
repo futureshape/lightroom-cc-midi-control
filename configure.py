@@ -90,6 +90,10 @@ class MidiWatcher:
         self._queue:    asyncio.Queue = None
         self._loop:     asyncio.AbstractEventLoop = None
 
+    def _queue_event(self, msg: list):
+        if self._queue is not None:
+            self._queue.put_nowait(msg)
+
     def open(self):
         ports = self._midi_in.get_ports()
         idx   = next((i for i, p in enumerate(ports) if p == self._port_name), None)
@@ -103,7 +107,28 @@ class MidiWatcher:
 
     def _callback(self, message, _):
         msg, _ = message
-        self._loop.call_soon_threadsafe(self._queue.put_nowait, list(msg))
+        self._loop.call_soon_threadsafe(self._queue_event, list(msg))
+
+    def flush_pending(self):
+        if self._queue is None:
+            return
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    async def flush_burst(self, settle_ms: int = 120):
+        """Drain trailing events from the same physical control gesture."""
+        if self._queue is None:
+            return
+
+        settle_s = settle_ms / 1000.0
+        while True:
+            try:
+                await asyncio.wait_for(self._queue.get(), timeout=settle_s)
+            except asyncio.TimeoutError:
+                break
 
     async def next_event(self, timeout: float = 30.0) -> Optional[dict]:
         """Wait for the next meaningful MIDI message and return a parsed event."""
@@ -117,7 +142,7 @@ class MidiWatcher:
             except asyncio.TimeoutError:
                 return None
             event = _parse_raw(raw)
-            if event:          # skip any messages we can't parse
+            if event and event["type"] != "note_off":
                 return event
 
     def close(self):
@@ -410,6 +435,7 @@ async def run_configure(lr_port: Optional[int] = None):
 
     watcher = MidiWatcher(midi_port)
     watcher.open()
+    watcher.flush_pending()
 
     try:
         while True:
@@ -422,6 +448,8 @@ async def run_configure(lr_port: Optional[int] = None):
                 event = await watcher.next_event(timeout=30.0)
             except KeyboardInterrupt:
                 break
+
+            await watcher.flush_burst()
 
             if event is None:
                 console.print("[yellow]Timed out — no input detected.[/yellow]")
@@ -442,6 +470,7 @@ async def run_configure(lr_port: Optional[int] = None):
                 if not Confirm.ask("  Remap this control?", default=True):
                     if not Confirm.ask("\nMap another control?", default=True):
                         break
+                    watcher.flush_pending()
                     continue
                 config["mappings"] = [
                     m for m in config["mappings"] if m.get("midi_key") != key
@@ -475,6 +504,8 @@ async def run_configure(lr_port: Optional[int] = None):
 
             if not Confirm.ask("\nMap another control?", default=True):
                 break
+
+            watcher.flush_pending()
 
     except KeyboardInterrupt:
         pass
