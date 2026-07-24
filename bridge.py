@@ -259,6 +259,12 @@ class Bridge:
         if not ok:
             raise RuntimeError("Failed to register with Lightroom.")
 
+        # Keep the edited panel visible while the bridge is active.
+        try:
+            await self._lr.call("revealAdjustedControls", True)
+        except Exception as e:
+            console.log(f"[yellow]warn[/yellow] revealAdjustedControls(True): {e}")
+
         # Subscribe to all parameter changes to keep the cache fresh
         await self._lr.subscribe("", self._on_lr_change)
 
