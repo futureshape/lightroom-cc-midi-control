@@ -99,7 +99,7 @@ class LightroomClient:
             self._recv_task.cancel()
             try:
                 await self._recv_task
-            except Exception:
+            except (asyncio.CancelledError, Exception):
                 pass
         if self._ws:
             await self._ws.close()

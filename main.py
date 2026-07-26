@@ -26,6 +26,7 @@ def _check_deps():
         ("python-rtmidi", "rtmidi"),
         ("websockets",    "websockets"),
         ("rich",          "rich"),
+        ("textual",       "textual"),
     ]:
         try:
             __import__(mod)
@@ -78,7 +79,7 @@ examples:
     if args.configure:
         from configure import run_configure
         try:
-            asyncio.run(run_configure(args.port))
+            run_configure(args.port)
         except KeyboardInterrupt:
             print("\nSetup cancelled.")
     else:

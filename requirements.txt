@@ -1,3 +1,4 @@
 python-rtmidi
 websockets
 rich
+textual

@@ -1,7 +1,4 @@
-"""
-Interactive setup: learn MIDI controls one-by-one and map them to
-Lightroom parameters or actions.  Saves to mappings.json when done.
-"""
+"""Textual configuration UI for the Lightroom MIDI bridge."""
 from __future__ import annotations
 
 import asyncio
@@ -10,23 +7,28 @@ from pathlib import Path
 from typing import Optional
 
 import rtmidi
-from rich.console import Console
-from rich.panel import Panel
-from rich.prompt import Confirm, IntPrompt, Prompt
-from rich.rule import Rule
-from rich.table import Table
-
-from lr_client import CONNECTIONS_FILE, LightroomClient
-from params import (
-    ACTIONS,
-    PARAMETERS,
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    OptionList,
+    Select,
+    Static,
 )
+from textual.widgets.option_list import Option
+
+from lr_client import LightroomClient
+from params import ACTIONS, PARAMETERS
 
 MAPPINGS_FILE = Path("mappings.json")
-console = Console()
 
-
-# ─────────────────────────────────────────── config helpers ──────────────────
 
 def load_config() -> dict:
     if MAPPINGS_FILE.exists():
@@ -34,128 +36,106 @@ def load_config() -> dict:
     return {"midi_port": None, "client_guid": None, "mappings": []}
 
 
-def save_config(config: dict):
-    MAPPINGS_FILE.write_text(json.dumps(config, indent=2))
-    console.print(f"\n[green]✓[/green] Saved to [bold]{MAPPINGS_FILE}[/bold]")
+def save_config(config: dict) -> None:
+    MAPPINGS_FILE.write_text(json.dumps(config, indent=2) + "\n")
 
-
-# ─────────────────────────────────────────── MIDI helpers ────────────────────
 
 def _midi_key(event: dict) -> str:
-    """Stable string key that uniquely identifies a physical MIDI control."""
-    t = event["type"]
-    if t == "cc":
+    event_type = event["type"]
+    if event_type == "cc":
         return f"cc:{event['channel']}:{event['cc']}"
-    if t in ("note_on", "note_off"):
+    if event_type in ("note_on", "note_off"):
         return f"note:{event['channel']}:{event['note']}"
-    if t == "pitch_bend":
+    if event_type == "pitch_bend":
         return f"pb:{event['channel']}"
     return f"other:{event.get('raw', '')}"
 
 
 def _related_midi_keys(event: dict) -> set[str]:
-    """Return all MIDI keys that may represent the same physical control."""
     key = _midi_key(event)
     keys = {key}
-
     if event["type"] != "cc":
         return keys
-
     cc = event["cc"]
     channel = event["channel"]
     if 0 <= cc <= 31:
         keys.add(f"cc:{channel}:{cc + 32}")
     elif 32 <= cc <= 63:
         keys.add(f"cc:{channel}:{cc - 32}")
-
     return keys
 
 
 def _describe_midi(event: dict) -> str:
-    t = event["type"]
-    if t == "cc":
-        return f"CC #{event['cc']}  ch {event['channel']}"
-    if t == "note_on":
-        return f"Note {event['note']}  ch {event['channel']}"
-    if t == "pitch_bend":
-        return f"Pitch Bend  ch {event['channel']}"
+    if event["type"] == "cc":
+        return f"CC #{event['cc']} · channel {event['channel']}"
+    if event["type"] == "note_on":
+        return f"Note {event['note']} · channel {event['channel']}"
+    if event["type"] == "pitch_bend":
+        return f"Pitch Bend · channel {event['channel']}"
     return str(event)
 
 
 def _parse_raw(msg: list) -> Optional[dict]:
-    status  = msg[0] & 0xF0
+    status = msg[0] & 0xF0
     channel = (msg[0] & 0x0F) + 1
     if status == 0xB0:
-        return {"type": "cc",         "channel": channel, "cc":   msg[1], "value": msg[2]}
+        return {"type": "cc", "channel": channel, "cc": msg[1], "value": msg[2]}
     if status == 0x90 and msg[2] > 0:
-        return {"type": "note_on",    "channel": channel, "note": msg[1], "velocity": msg[2]}
+        return {
+            "type": "note_on",
+            "channel": channel,
+            "note": msg[1],
+            "velocity": msg[2],
+        }
     if status == 0x80 or (status == 0x90 and msg[2] == 0):
-        return {"type": "note_off",   "channel": channel, "note": msg[1]}
+        return {"type": "note_off", "channel": channel, "note": msg[1]}
     if status == 0xE0:
-        return {"type": "pitch_bend", "channel": channel,
-                "value": ((msg[2] << 7) | msg[1]) - 8192}
+        return {
+            "type": "pitch_bend",
+            "channel": channel,
+            "value": ((msg[2] << 7) | msg[1]) - 8192,
+        }
     return None
 
 
-# ─────────────────────────────────────────── MidiWatcher ─────────────────────
-
 class MidiWatcher:
-    """Keeps a MIDI input port open for the duration of the configure session."""
+    """Keep a MIDI input open and expose its messages through an async queue."""
 
     def __init__(self, port_name: str):
         self._port_name = port_name
-        self._midi_in   = rtmidi.MidiIn()
-        self._queue:    asyncio.Queue = None
-        self._loop:     asyncio.AbstractEventLoop = None
+        self._midi_in = rtmidi.MidiIn()
+        self._queue: Optional[asyncio.Queue] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    def _queue_event(self, msg: list):
-        if self._queue is not None:
-            self._queue.put_nowait(msg)
-
-    def open(self):
+    def open(self) -> None:
         ports = self._midi_in.get_ports()
-        idx   = next((i for i, p in enumerate(ports) if p == self._port_name), None)
-        if idx is None:
-            raise RuntimeError(f"MIDI port '{self._port_name}' not found. Available: {ports}")
-        self._loop  = asyncio.get_running_loop()
+        index = next((i for i, name in enumerate(ports) if name == self._port_name), None)
+        if index is None:
+            raise RuntimeError(f"MIDI port '{self._port_name}' is no longer available.")
+        self._loop = asyncio.get_running_loop()
         self._queue = asyncio.Queue()
         self._midi_in.ignore_types(sysex=True, timing=True, active_sense=True)
-        self._midi_in.open_port(idx)
+        self._midi_in.open_port(index)
         self._midi_in.set_callback(self._callback)
 
-    def _callback(self, message, _):
+    def _callback(self, message, _) -> None:
         msg, _ = message
-        self._loop.call_soon_threadsafe(self._queue_event, list(msg))
+        if self._loop is not None and self._queue is not None:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, list(msg))
 
-    def flush_pending(self):
+    def flush_pending(self) -> None:
         if self._queue is None:
             return
         while True:
             try:
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
-                break
+                return
 
-    async def flush_burst(self, settle_ms: int = 120):
-        """Drain trailing events from the same physical control gesture."""
+    async def next_event(self, timeout: float = 30.0) -> Optional[dict]:
         if self._queue is None:
-            return
-
-        settle_s = settle_ms / 1000.0
-        while True:
-            try:
-                await asyncio.wait_for(self._queue.get(), timeout=settle_s)
-            except asyncio.TimeoutError:
-                break
-
-    async def next_event(
-        self,
-        timeout: float = 30.0,
-        ignored_keys: Optional[set[str]] = None,
-    ) -> Optional[dict]:
-        """Wait for the next meaningful MIDI message and return a parsed event."""
+            return None
         deadline = asyncio.get_running_loop().time() + timeout
-        ignored_keys = ignored_keys or set()
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
@@ -165,384 +145,463 @@ class MidiWatcher:
             except asyncio.TimeoutError:
                 return None
             event = _parse_raw(raw)
-            if not event or event["type"] == "note_off":
-                continue
-            if _related_midi_keys(event) & ignored_keys:
-                continue
-            if event:
+            if event and event["type"] != "note_off":
                 return event
 
-    def close(self):
+    async def flush_burst(self, settle_ms: int = 120) -> None:
+        if self._queue is None:
+            return
+        while True:
+            try:
+                await asyncio.wait_for(self._queue.get(), timeout=settle_ms / 1000)
+            except asyncio.TimeoutError:
+                return
+
+    def close(self) -> None:
         try:
             self._midi_in.close_port()
         except Exception:
             pass
-        del self._midi_in
 
-
-# ─────────────────────────────────────────── interactive mapping ──────────────
 
 def _mapping_choices() -> list[dict]:
     choices: list[dict] = []
-
     for param in PARAMETERS:
-        choices.append({
-            "action_type": "setValue",
-            "label": param.label,
-            "category": param.category,
-            "search_text": " ".join([
-                param.label.lower(),
-                param.name.lower(),
-                param.category.lower(),
-                "slider develop parameter",
-            ]),
-            "mapping": {
+        choices.append(
+            {
                 "action_type": "setValue",
-                "parameter": param.name,
                 "label": param.label,
-                "min_val": param.min_val,
-                "max_val": param.max_val,
-                "sensitivity": param.sensitivity,
-            },
-        })
-
+                "category": param.category,
+                "search_text": " ".join(
+                    (param.label, param.name, param.category, "slider develop parameter")
+                ).lower(),
+                "mapping": {
+                    "action_type": "setValue",
+                    "parameter": param.name,
+                    "label": param.label,
+                    "min_val": param.min_val,
+                    "max_val": param.max_val,
+                    "sensitivity": param.sensitivity,
+                },
+            }
+        )
     for action, label, category in ACTIONS:
-        choices.append({
-            "action_type": "action",
-            "label": label,
-            "category": category,
-            "search_text": " ".join([
-                label.lower(),
-                action.lower(),
-                category.lower(),
-                "action",
-            ]),
-            "mapping": {
+        choices.append(
+            {
                 "action_type": "action",
-                "action": action,
                 "label": label,
-            },
-        })
-
+                "category": category,
+                "search_text": " ".join((label, action, category, "action")).lower(),
+                "mapping": {
+                    "action_type": "action",
+                    "action": action,
+                    "label": label,
+                },
+            }
+        )
     return choices
 
 
-def _match_choices(query: str, choices: list[dict], limit: int = 10) -> list[dict]:
+def _match_choices(query: str, choices: list[dict], limit: int = 50) -> list[dict]:
     query = query.strip().lower()
     if not query:
-        return sorted(choices, key=lambda item: (item["action_type"], item["label"]))[:limit]
-
+        return sorted(choices, key=lambda item: (item["category"], item["label"]))[:limit]
     terms = query.split()
-    scored: list[tuple[tuple[int, int, int, str], dict]] = []
-
+    scored = []
     for choice in choices:
-        haystack = choice["search_text"]
-        if not all(term in haystack for term in terms):
+        if not all(term in choice["search_text"] for term in terms):
             continue
-
         label = choice["label"].lower()
         category = choice["category"].lower()
-        starts_with = 0 if label.startswith(query) else 1
-        label_hits = sum(label.find(term) if term in label else len(label) for term in terms)
-        category_hits = sum(category.find(term) if term in category else len(category) for term in terms)
-        score = (starts_with, label_hits + category_hits, len(label), label)
+        score = (
+            0 if label.startswith(query) else 1,
+            sum(label.find(term) if term in label else len(label) for term in terms)
+            + sum(
+                category.find(term) if term in category else len(category)
+                for term in terms
+            ),
+            len(label),
+            label,
+        )
         scored.append((score, choice))
-
     scored.sort(key=lambda item: item[0])
     return [choice for _, choice in scored[:limit]]
 
 
-def _show_choice_matches(matches: list[dict], query: str):
-    title = "Matches" if query else "Popular mappings"
-    table = Table(title=title, show_header=True, header_style="bold dim", box=None, padding=(0, 2))
-    table.add_column("#", style="cyan", justify="right")
-    table.add_column("Type")
-    table.add_column("Target")
-    table.add_column("Details", overflow="fold")
+class ConfigureApp(App[dict]):
+    """Interactive, non-linear mapping editor."""
 
-    for idx, choice in enumerate(matches, 1):
-        if choice["action_type"] == "setValue":
-            mapping = choice["mapping"]
-            details = (
-                f"{choice['category']} slider  "
-                f"[dim]{mapping['min_val']} … {mapping['max_val']}[/dim]"
-            )
-            kind = "Slider"
-        else:
-            details = f"{choice['category'].title()} action"
-            kind = "Action"
+    TITLE = "Lightroom MIDI Bridge"
+    SUB_TITLE = "Controller setup"
+    CSS = """
+    Screen { background: #0b1018; color: #d9e2f1; }
+    Header { background: #111a28; color: #f5f8ff; }
+    #status-bar { height: 3; padding: 1 2; background: #111a28; color: #91a4bd; }
+    #status-bar .ok { color: #73dba4; }
+    #topbar { height: 5; padding: 0 2 1 2; background: #111a28; }
+    #port-select { width: 1fr; margin-right: 1; }
+    #refresh { width: 18; margin-left: 1; }
+    #connect { width: 20; margin-left: 1; background: #275f9f; }
+    #workspace { height: 1fr; padding: 1 2; }
+    .panel { border: round #26364d; background: #0e1622; }
+    .panel-title { height: 2; padding: 0 1; color: #7cb8ff; text-style: bold; }
+    #mapping-panel { width: 3fr; margin-right: 1; }
+    #target-panel { width: 2fr; margin-left: 1; }
+    #mapping-table { height: 1fr; }
+    #empty-help { height: 3; padding: 1; color: #71849e; }
+    #mapping-actions, #assignment-actions { height: 3; padding: 0 1; }
+    #mapping-actions Button, #assignment-actions Button { margin-right: 1; }
+    #learn { width: 24; background: #275f9f; }
+    #delete { width: 18; background: #713641; }
+    #search { margin: 0 1 1 1; }
+    #targets { height: 1fr; margin: 0 1; border: tall #1d2b3e; }
+    #selection { height: 4; padding: 1 2; color: #aebdd0; }
+    #settings { height: 5; padding: 0 1; }
+    #mode { width: 1fr; margin-right: 1; }
+    #sensitivity { width: 1fr; }
+    #assign { width: 18; background: #236548; }
+    #save { width: 10; background: #275f9f; }
+    #dirty { width: 15; padding: 1; color: #f0bd67; }
+    Button.-primary { background: #2878d4; }
+    Button.-success { background: #23865c; }
+    Button.-error { background: #9f4050; }
+    Footer { background: #111a28; }
+    """
+    BINDINGS = [
+        Binding("ctrl+s", "save", "Save"),
+        Binding("ctrl+l", "listen", "Listen"),
+        Binding("delete", "delete_mapping", "Delete"),
+        Binding("q", "quit", "Quit"),
+    ]
 
-        table.add_row(str(idx), kind, choice["label"], details)
+    def __init__(self, lr_port: Optional[int] = None):
+        super().__init__()
+        self.lr_port = lr_port
+        self.config = load_config()
+        self.choices = _mapping_choices()
+        self.filtered_choices: list[dict] = []
+        self.selected_choice: Optional[dict] = None
+        self.pending_event: Optional[dict] = None
+        self.watcher: Optional[MidiWatcher] = None
+        self.lr: Optional[LightroomClient] = None
+        self.dirty = False
 
-    console.print(table)
-
-
-def _choose_target() -> Optional[dict]:
-    choices = _mapping_choices()
-    query = ""
-
-    console.print()
-    console.print(
-        "[bold]Bind to:[/bold] [dim]search by name or category "
-        "(examples: exposure, next, flag, zoom, color)[/dim]"
-    )
-
-    while True:
-        query = Prompt.ask("  Search", default=query).strip()
-        matches = _match_choices(query, choices)
-        if not matches:
-            console.print("[yellow]No matches. Try a broader search.[/yellow]")
-            continue
-
-        _show_choice_matches(matches, query)
-        raw = console.input("  Select number, or press Enter to refine search: ").strip()
-        if not raw:
-            continue
-        if raw.lower() in {"q", "quit", "cancel"}:
-            return None
-        if not raw.isdigit():
-            console.print("[yellow]Enter a result number, or press Enter to search again.[/yellow]")
-            continue
-
-        idx = int(raw)
-        if not 1 <= idx <= len(matches):
-            console.print("[yellow]Selection out of range.[/yellow]")
-            continue
-
-        return matches[idx - 1]
-
-
-def _choose_slider_mode(mapping: dict) -> dict:
-    console.print()
-    console.print("[bold]Mode:[/bold]")
-    console.print(
-        "  [cyan]1[/cyan]  Absolute  "
-        "[dim]CC 0→127 maps linearly across the full range  "
-        "(faders / pots)[/dim]"
-    )
-    console.print(
-        "  [cyan]2[/cyan]  Relative  "
-        "[dim]turn/nudge to increase or decrease  "
-        "(endless encoders)[/dim]"
-    )
-    mode = (
-        "absolute"
-        if Prompt.ask("  Mode", choices=["1", "2"], default="1") == "1"
-        else "relative"
-    )
-
-    result = dict(mapping)
-    result["mode"] = mode
-    sensitivity = result["sensitivity"]
-    if mode == "relative":
-        console.print(
-            f"\n  [dim]Default sensitivity: {sensitivity} units per encoder tick. "
-            f"(Range is {result['min_val']}…{result['max_val']})[/dim]"
-        )
-        if Confirm.ask("  Adjust sensitivity?", default=False):
-            raw = Prompt.ask("  Sensitivity", default=str(sensitivity))
-            try:
-                sensitivity = float(raw)
-            except ValueError:
-                pass
-        result["sensitivity"] = sensitivity
-
-    return result
-
-def _choose_mapping() -> Optional[dict]:
-    """Ask the user what Lightroom function to bind to a control."""
-    choice = _choose_target()
-    if not choice:
-        return None
-
-    mapping = choice["mapping"]
-    if mapping["action_type"] == "setValue":
-        return _choose_slider_mode(mapping)
-    return mapping
-
-
-# ─────────────────────────────────────────── main flow ───────────────────────
-
-async def run_configure(lr_port: Optional[int] = None):
-    console.print(Panel.fit(
-        "[bold blue]Lightroom MIDI Bridge[/bold blue]  ·  Setup",
-        border_style="blue",
-    ))
-
-    # ── 1. Check feature is enabled ──────────────────────────────────────────
-    if not CONNECTIONS_FILE.exists():
-        console.print(Panel(
-            "[yellow]External controllers are not yet enabled in Lightroom.[/yellow]\n\n"
-            "To enable:\n"
-            "  1. Open [bold]Adobe Lightroom[/bold]\n"
-            "  2. [bold]Lightroom → Preferences → Interface[/bold]\n"
-            "  3. Tick [bold]'Enable external controllers'[/bold]\n"
-            "  4. Restart Lightroom\n"
-            "  5. Run setup again.",
-            title="[yellow]Action required[/yellow]",
-            border_style="yellow",
-        ))
-        return
-
-    config = load_config()
-
-    # ── 2. Pick MIDI port ────────────────────────────────────────────────────
-    console.print(Rule("[bold]MIDI input[/bold]"))
-    _tmp = rtmidi.MidiIn()
-    ports = _tmp.get_ports()
-    del _tmp
-
-    if not ports:
-        console.print("[red]No MIDI input devices found. Connect one and try again.[/red]")
-        return
-
-    for i, p in enumerate(ports, 1):
-        current = " [green]← current[/green]" if p == config.get("midi_port") else ""
-        console.print(f"  [cyan]{i}[/cyan]  {p}{current}")
-
-    default_idx = (
-        ports.index(config["midi_port"]) + 1
-        if config.get("midi_port") in ports
-        else 1
-    )
-    choice    = IntPrompt.ask("Select port", default=default_idx)
-    midi_port = ports[max(0, min(choice - 1, len(ports) - 1))]
-    config["midi_port"] = midi_port
-    console.print(f"[green]✓[/green] {midi_port}")
-
-    # ── 3. Connect to Lightroom ──────────────────────────────────────────────
-    console.print(Rule("[bold]Lightroom[/bold]"))
-    lr = LightroomClient(lr_port)
-    try:
-        await lr.connect()
-    except Exception as e:
-        console.print(
-            f"[red]✗ Could not connect to Lightroom at {lr.url}[/red]\n"
-            f"  {e}\n"
-            "  Make sure Lightroom is open and 'Enable external controllers' is on."
-        )
-        return
-
-    console.print(f"  Registering with Lightroom… ", end="")
-    try:
-        ok = await lr.register(client_guid=config.get("client_guid"))
-    except Exception as e:
-        console.print(f"[red]✗ {e}[/red]")
-        await lr.close()
-        return
-
-    if not ok:
-        console.print("[red]✗ Registration failed.[/red]")
-        await lr.close()
-        return
-
-    config["client_guid"] = lr.client_guid
-    console.print(
-        "[green]✓ Connected[/green]  "
-        "[dim](accept the pairing dialog in Lightroom if prompted)[/dim]"
-    )
-
-    # ── 4. Show existing mappings ────────────────────────────────────────────
-    if config["mappings"]:
-        console.print(Rule("[bold]Current mappings[/bold]"))
-        t = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 2))
-        t.add_column("MIDI control")
-        t.add_column("→  Parameter / Action")
-        t.add_column("Mode")
-        for m in config["mappings"]:
-            t.add_row(
-                m.get("midi_desc", m.get("midi_key", "?")),
-                m.get("label",     m.get("action",   "?")),
-                m.get("mode",      m.get("action_type", "?")),
-            )
-        console.print(t)
-
-    # ── 5. Mapping loop ──────────────────────────────────────────────────────
-    console.print(Rule("[bold]Map controls[/bold]"))
-
-    watcher = MidiWatcher(midi_port)
-    watcher.open()
-    watcher.flush_pending()
-    ignored_keys: set[str] = set()
-
-    try:
-        while True:
-            console.print(
-                "\n[bold]Move or press a control on your MIDI device…[/bold]  "
-                "[dim](Ctrl+C to finish)[/dim]"
-            )
-
-            try:
-                event = await watcher.next_event(timeout=30.0, ignored_keys=ignored_keys)
-            except KeyboardInterrupt:
-                break
-
-            await watcher.flush_burst()
-
-            if event is None:
-                console.print("[yellow]Timed out — no input detected.[/yellow]")
-                if not Confirm.ask("Try again?", default=True):
-                    break
-                continue
-
-            key  = _midi_key(event)
-            related_keys = _related_midi_keys(event)
-            desc = _describe_midi(event)
-            console.print(f"\n[green]▶  Detected:[/green] [bold]{desc}[/bold]", end="")
-
-            existing = next(
-                (m for m in config["mappings"] if m.get("midi_key") == key), None
-            )
-            if existing:
-                lbl = existing.get("label", existing.get("action", "?"))
-                console.print(f"  [dim](currently → {lbl})[/dim]")
-                if not Confirm.ask("  Remap this control?", default=True):
-                    if not Confirm.ask("\nMap another control?", default=True):
-                        break
-                    watcher.flush_pending()
-                    ignored_keys = set(related_keys)
-                    continue
-                config["mappings"] = [
-                    m for m in config["mappings"] if m.get("midi_key") != key
-                ]
-            else:
-                console.print()
-
-            mapping = _choose_mapping()
-            if mapping:
-                mapping.update({
-                    "midi_key":  key,
-                    "midi_type": event["type"],
-                    "midi_desc": desc,
-                })
-                if event["type"] == "cc":
-                    mapping["cc"]      = event["cc"]
-                    mapping["channel"] = event["channel"]
-                elif event["type"] == "note_on":
-                    mapping["note"]    = event["note"]
-                    mapping["channel"] = event["channel"]
-                elif event["type"] == "pitch_bend":
-                    mapping["channel"] = event["channel"]
-
-                config["mappings"].append(mapping)
-                target = mapping.get("label", mapping.get("action", "?"))
-                mode_hint = mapping.get("mode", mapping.get("action_type", ""))
-                console.print(
-                    f"[green]✓  Mapped:[/green] {desc} → [bold]{target}[/bold]"
-                    f"  [dim]({mode_hint})[/dim]"
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("● MIDI not selected    ● Lightroom not connected", id="status-bar")
+        with Horizontal(id="topbar"):
+            yield Select([], prompt="Select a MIDI input", id="port-select")
+            yield Button("Refresh devices", id="refresh")
+            yield Button("Connect Lightroom", id="connect", variant="primary")
+        with Horizontal(id="workspace"):
+            with Vertical(classes="panel", id="mapping-panel"):
+                yield Label("YOUR MAPPINGS", classes="panel-title")
+                yield DataTable(id="mapping-table", cursor_type="row", zebra_stripes=True)
+                yield Static(
+                    "No mappings yet. Select a target, then listen for a hardware control.",
+                    id="empty-help",
                 )
+                with Horizontal(id="mapping-actions"):
+                    yield Button("Listen for control", id="learn", variant="primary")
+                    yield Button("Delete selected", id="delete", variant="error")
+            with Vertical(classes="panel", id="target-panel"):
+                yield Label("LIGHTROOM TARGETS", classes="panel-title")
+                yield Input(
+                    placeholder="Search parameters, actions, or categories…",
+                    id="search",
+                )
+                yield OptionList(id="targets")
+                yield Static("Choose a target from the list.", id="selection")
+                with Horizontal(id="settings"):
+                    yield Select(
+                        [("Absolute · fader / knob", "absolute"),
+                         ("Relative · endless encoder", "relative")],
+                        value="absolute",
+                        id="mode",
+                    )
+                    yield Input(
+                        placeholder="Sensitivity",
+                        type="number",
+                        id="sensitivity",
+                    )
+                with Horizontal(id="assignment-actions"):
+                    yield Button("Assign mapping", id="assign", variant="success")
+                    yield Button("Save", id="save", variant="primary")
+                    yield Static("", id="dirty")
+        yield Footer()
 
-            if not Confirm.ask("\nMap another control?", default=True):
-                break
+    def on_mount(self) -> None:
+        table = self.query_one("#mapping-table", DataTable)
+        table.add_columns("MIDI control", "Lightroom target", "Mode")
+        self.refresh_ports()
+        self._refresh_mappings()
+        self._refresh_targets("")
+        self._refresh_status()
 
-            watcher.flush_pending()
-            ignored_keys = set(related_keys)
+    def refresh_ports(self) -> None:
+        midi_in = rtmidi.MidiIn()
+        ports = midi_in.get_ports()
+        del midi_in
+        select = self.query_one("#port-select", Select)
+        select.set_options([(name, name) for name in ports])
+        current = self.config.get("midi_port")
+        if current in ports:
+            select.value = current
+        elif ports:
+            select.value = ports[0]
+            self.config["midi_port"] = ports[0]
+        self._refresh_status()
 
-    except KeyboardInterrupt:
-        pass
-    finally:
-        watcher.close()
+    def _refresh_status(self, message: Optional[str] = None) -> None:
+        port = self.config.get("midi_port")
+        midi = f"[green]●[/green] MIDI  {port}" if port else "[#71849e]●[/] MIDI not selected"
+        lightroom = (
+            f"[green]●[/green] Lightroom  {self.lr.url}"
+            if self.lr
+            else "[#71849e]●[/] Lightroom not connected"
+        )
+        suffix = f"    [#f0bd67]{message}[/]" if message else ""
+        self.query_one("#status-bar", Static).update(f"{midi}    {lightroom}{suffix}")
 
-    save_config(config)
-    console.print(f"[dim]{len(config['mappings'])} mapping(s) total.[/dim]")
-    await lr.close()
+    def _refresh_mappings(self) -> None:
+        table = self.query_one("#mapping-table", DataTable)
+        table.clear()
+        for index, mapping in enumerate(self.config.get("mappings", [])):
+            table.add_row(
+                mapping.get("midi_desc", mapping.get("midi_key", "?")),
+                mapping.get("label", mapping.get("action", "?")),
+                mapping.get("mode", "Action").title(),
+                key=str(index),
+            )
+        self.query_one("#empty-help").display = not bool(self.config.get("mappings"))
+
+    def _refresh_targets(self, query: str) -> None:
+        self.filtered_choices = _match_choices(query, self.choices)
+        options = []
+        for choice in self.filtered_choices:
+            kind = "Slider" if choice["action_type"] == "setValue" else "Action"
+            options.append(
+                Option(
+                    f"{choice['label']}  [#71849e]{choice['category']} · {kind}[/]",
+                    id=choice["mapping"].get("parameter", choice["mapping"].get("action")),
+                )
+            )
+        target_list = self.query_one("#targets", OptionList)
+        target_list.clear_options()
+        target_list.add_options(options)
+        if options:
+            target_list.highlighted = 0
+            self._select_choice(0)
+
+    def _select_choice(self, index: int) -> None:
+        if not 0 <= index < len(self.filtered_choices):
+            return
+        self.selected_choice = self.filtered_choices[index]
+        choice = self.selected_choice
+        mapping = choice["mapping"]
+        if choice["action_type"] == "setValue":
+            detail = (
+                f"[bold]{choice['label']}[/bold]\n"
+                f"{choice['category']} slider · {mapping['min_val']} to {mapping['max_val']}"
+            )
+            self.query_one("#settings").display = True
+            self.query_one("#sensitivity", Input).value = str(mapping["sensitivity"])
+        else:
+            detail = f"[bold]{choice['label']}[/bold]\n{choice['category'].title()} action"
+            self.query_one("#settings").display = False
+        self.query_one("#selection", Static).update(detail)
+
+    def _mark_dirty(self) -> None:
+        self.dirty = True
+        self.query_one("#dirty", Static).update("Unsaved changes")
+
+    @on(Select.Changed, "#port-select")
+    def port_changed(self, event: Select.Changed) -> None:
+        if event.value is Select.BLANK:
+            return
+        port = str(event.value)
+        if port != self.config.get("midi_port"):
+            self.config["midi_port"] = port
+            self._close_watcher()
+            self._mark_dirty()
+        self._refresh_status()
+
+    @on(Input.Changed, "#search")
+    def search_changed(self, event: Input.Changed) -> None:
+        self._refresh_targets(event.value)
+
+    @on(OptionList.OptionHighlighted, "#targets")
+    def target_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        self._select_choice(event.option_index)
+
+    @on(OptionList.OptionSelected, "#targets")
+    def target_selected(self, event: OptionList.OptionSelected) -> None:
+        self._select_choice(event.option_index)
+        if self.pending_event is None:
+            self.action_listen()
+
+    @on(Button.Pressed, "#refresh")
+    def refresh_pressed(self) -> None:
+        self.refresh_ports()
+        self.notify("MIDI device list refreshed")
+
+    @on(Button.Pressed, "#connect")
+    def connect_pressed(self) -> None:
+        self.connect_lightroom()
+
+    @work(exclusive=True, group="lightroom")
+    async def connect_lightroom(self) -> None:
+        self.query_one("#connect", Button).disabled = True
+        self._refresh_status("Connecting…")
+        client = LightroomClient(self.lr_port)
+        try:
+            await client.connect()
+            ok = await client.register(client_guid=self.config.get("client_guid"))
+            if not ok:
+                raise RuntimeError("Lightroom rejected registration")
+        except Exception as error:
+            await client.close()
+            self.notify(str(error), title="Could not connect", severity="error")
+            self._refresh_status("Open Lightroom and enable external controllers")
+        else:
+            if self.lr:
+                await self.lr.close()
+            self.lr = client
+            self.config["client_guid"] = client.client_guid
+            self._mark_dirty()
+            self._refresh_status("Connected")
+            self.notify("Lightroom is connected")
+        finally:
+            self.query_one("#connect", Button).disabled = False
+
+    def _ensure_watcher(self) -> bool:
+        port = self.config.get("midi_port")
+        if not port:
+            self.notify("Select a MIDI input first", severity="warning")
+            return False
+        if self.watcher is None:
+            try:
+                self.watcher = MidiWatcher(port)
+                self.watcher.open()
+            except Exception as error:
+                self.watcher = None
+                self.notify(str(error), severity="error")
+                return False
+        return True
+
+    def action_listen(self) -> None:
+        if not self.selected_choice:
+            self.notify("Choose a Lightroom target first", severity="warning")
+            return
+        if self._ensure_watcher():
+            self.listen_for_control()
+
+    @on(Button.Pressed, "#learn")
+    def listen_pressed(self) -> None:
+        self.action_listen()
+
+    @work(exclusive=True, group="midi-listen")
+    async def listen_for_control(self) -> None:
+        assert self.watcher is not None
+        button = self.query_one("#learn", Button)
+        button.label = "Listening… move a control"
+        button.disabled = True
+        self.watcher.flush_pending()
+        self._refresh_status("Listening for MIDI input…")
+        event = await self.watcher.next_event(timeout=30)
+        if event:
+            await self.watcher.flush_burst()
+            self.pending_event = event
+            button.label = f"Detected: {_describe_midi(event)}"
+            self._refresh_status("Control detected — assign when ready")
+            self.notify(_describe_midi(event), title="MIDI control detected")
+        else:
+            button.label = "Listen for control"
+            self._refresh_status("Listening timed out")
+            self.notify("No MIDI input received", severity="warning")
+        button.disabled = False
+
+    @on(Button.Pressed, "#assign")
+    def assign_pressed(self) -> None:
+        if not self.pending_event:
+            self.notify("Listen for a hardware control first", severity="warning")
+            return
+        if not self.selected_choice:
+            self.notify("Choose a Lightroom target", severity="warning")
+            return
+        mapping = dict(self.selected_choice["mapping"])
+        event = self.pending_event
+        if mapping["action_type"] == "setValue":
+            mapping["mode"] = str(self.query_one("#mode", Select).value)
+            try:
+                mapping["sensitivity"] = float(
+                    self.query_one("#sensitivity", Input).value
+                )
+            except ValueError:
+                self.notify("Sensitivity must be a number", severity="error")
+                return
+        key = _midi_key(event)
+        mapping.update(
+            midi_key=key,
+            midi_type=event["type"],
+            midi_desc=_describe_midi(event),
+            channel=event["channel"],
+        )
+        if event["type"] == "cc":
+            mapping["cc"] = event["cc"]
+        elif event["type"] == "note_on":
+            mapping["note"] = event["note"]
+        mappings = self.config.setdefault("mappings", [])
+        mappings[:] = [item for item in mappings if item.get("midi_key") != key]
+        mappings.append(mapping)
+        self.pending_event = None
+        self.query_one("#learn", Button).label = "Listen for control"
+        self._refresh_mappings()
+        self._mark_dirty()
+        self._refresh_status("Mapping added")
+        self.notify(f"{mapping['midi_desc']} → {mapping['label']}")
+
+    def action_delete_mapping(self) -> None:
+        table = self.query_one("#mapping-table", DataTable)
+        if table.row_count == 0:
+            return
+        row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
+        index = int(str(row_key.value))
+        removed = self.config["mappings"].pop(index)
+        self._refresh_mappings()
+        self._mark_dirty()
+        self.notify(f"Removed {removed.get('label', 'mapping')}")
+
+    @on(Button.Pressed, "#delete")
+    def delete_pressed(self) -> None:
+        self.action_delete_mapping()
+
+    def action_save(self) -> None:
+        save_config(self.config)
+        self.dirty = False
+        self.query_one("#dirty", Static).update("Saved")
+        self.notify(f"Saved {len(self.config.get('mappings', []))} mappings")
+
+    @on(Button.Pressed, "#save")
+    def save_pressed(self) -> None:
+        self.action_save()
+
+    def action_quit(self) -> None:
+        if self.dirty:
+            save_config(self.config)
+        self.exit(self.config)
+
+    def _close_watcher(self) -> None:
+        if self.watcher:
+            self.watcher.close()
+            self.watcher = None
+
+    async def on_unmount(self) -> None:
+        self._close_watcher()
+        if self.lr:
+            await self.lr.close()
+
+
+def run_configure(lr_port: Optional[int] = None) -> None:
+    """Run the configuration application."""
+    ConfigureApp(lr_port).run()

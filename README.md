@@ -41,13 +41,16 @@ python3 -m venv .venv
 .venv/bin/python main.py --configure
 ```
 
-The setup wizard will:
+The setup app gives you a persistent workspace where you can:
 
-1. List your available MIDI input ports — pick one
-2. Connect to Lightroom (accept the pairing dialog that appears)
-3. Show current mappings (if any)
-4. **Learn loop:** move or press a control on your device → it detects the CC/note/channel automatically → search for the Lightroom target by name or category and select it → repeat for as many controls as you like
-5. Press **Ctrl+C** (or answer "n" to "Map another?") to save and exit
+- Select or refresh your MIDI input and connect to Lightroom
+- Browse and search every Lightroom parameter and action
+- See, replace, and delete all mappings in one table
+- Choose a target, listen for a hardware control, then assign it
+- Configure absolute faders/knobs or relative endless encoders
+
+Use **Ctrl+S** to save, **Ctrl+L** to listen for a control, and **Q** to save and
+quit. You can also use the on-screen buttons throughout.
 
 Mappings are saved to `mappings.json` in the project folder.
 
@@ -107,7 +110,7 @@ Lightroom CC exposes a JSON-over-WebSocket API documented inside its own app bun
 lightroom-control/
 ├── main.py          Entry point and argument parsing
 ├── lr_client.py     Async WebSocket client for the Lightroom API
-├── configure.py     Interactive mapping setup
+├── configure.py     Textual mapping editor
 ├── bridge.py        Real-time MIDI → Lightroom bridge
 ├── params.py        Parameter and action catalogue with ranges
 ├── requirements.txt
