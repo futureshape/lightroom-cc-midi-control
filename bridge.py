@@ -61,6 +61,22 @@ def _relative_delta(mode: str, value: int) -> Optional[int]:
     return value if value < 64 else value - 128
 
 
+def _numeric_value(raw, param: Optional[str] = None) -> float:
+    """Extract a numeric adjustment value from Lightroom's response shapes."""
+    if isinstance(raw, bool):
+        raise ValueError("boolean is not an adjustment value")
+    if isinstance(raw, (int, float, str)):
+        return float(raw)
+    if isinstance(raw, (list, tuple)) and len(raw) == 1:
+        return _numeric_value(raw[0], param)
+    if isinstance(raw, dict):
+        if param and param in raw:
+            return _numeric_value(raw[param], param)
+        if "value" in raw:
+            return _numeric_value(raw["value"], param)
+    raise ValueError(f"unsupported Lightroom value: {raw!r}")
+
+
 class Bridge:
     """
     Connects one MIDI input port to Lightroom via WebSocket.
@@ -119,7 +135,7 @@ class Bridge:
         if isinstance(response, dict):
             for k, v in response.items():
                 try:
-                    self._lr_cache[k] = float(v)
+                    self._lr_cache[k] = _numeric_value(v, k)
                 except (TypeError, ValueError):
                     pass
 
@@ -155,9 +171,11 @@ class Bridge:
 
         try:
             raw = await self._lr.call("getValue", param)
-            current = float(raw) if raw is not None else 0.0
-        except Exception:
-            current = 0.0
+            current = _numeric_value(raw, param)
+        except Exception as error:
+            raise RuntimeError(
+                f"Could not read current Lightroom value for {param}: {error}"
+            ) from error
 
         self._lr_cache[param] = current
         return current
