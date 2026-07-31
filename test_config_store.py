@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from config_store import load_config, mappings_for, save_config
+from config_store import clear_mappings, load_config, mappings_for, save_config
 
 
 class ConfigStoreTests(unittest.TestCase):
@@ -39,6 +39,16 @@ class ConfigStoreTests(unittest.TestCase):
             save_config(config, path)
 
             self.assertEqual(load_config(path), config)
+
+    def test_clear_mappings_only_resets_selected_controller(self):
+        config = {"midi_port": "A", "controllers": {
+            "A": {"mappings": [{"midi_key": "cc:1:1"}]},
+            "B": {"mappings": [{"midi_key": "cc:1:2"}]},
+        }}
+
+        self.assertEqual(clear_mappings(config), 1)
+        self.assertEqual(mappings_for(config, "A"), [])
+        self.assertEqual(mappings_for(config, "B"), [{"midi_key": "cc:1:2"}])
 
 
 if __name__ == "__main__":

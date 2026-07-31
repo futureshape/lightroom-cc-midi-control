@@ -53,3 +53,11 @@ def mappings_for(config: dict, port: Optional[str] = None) -> list[dict]:
     controllers = config.setdefault("controllers", {})
     profile = controllers.setdefault(str(selected_port), {"mappings": []})
     return profile.setdefault("mappings", [])
+
+
+def clear_mappings(config: dict, port: Optional[str] = None) -> int:
+    """Clear one controller profile and return the number removed."""
+    mappings = mappings_for(config, port)
+    removed = len(mappings)
+    mappings.clear()
+    return removed

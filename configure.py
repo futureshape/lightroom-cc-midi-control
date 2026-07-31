@@ -9,6 +9,7 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
     DataTable,
@@ -24,7 +25,7 @@ from textual.widgets.option_list import Option
 
 from lr_client import LightroomClient
 from params import ACTIONS, PARAMETERS
-from config_store import empty_config, load_config, mappings_for, save_config
+from config_store import clear_mappings, empty_config, load_config, mappings_for, save_config
 
 
 def _midi_key(event: dict) -> str:
@@ -215,6 +216,52 @@ def _match_choices(query: str, choices: list[dict], limit: int = 50) -> list[dic
     return [choice for _, choice in scored[:limit]]
 
 
+class ConfirmResetScreen(ModalScreen[bool]):
+    """Confirmation dialog for clearing the active controller profile."""
+
+    CSS = """
+    ConfirmResetScreen { align: center middle; background: $background 60%; }
+    #reset-dialog {
+        width: 60; height: 12; padding: 1 2;
+        border: round #9f4050; background: #111a28;
+    }
+    #reset-title { height: 2; color: #f5f8ff; text-style: bold; }
+    #reset-message { height: 4; color: #aebdd0; }
+    #reset-dialog-actions { height: 3; align-horizontal: right; }
+    #reset-dialog-actions Button { margin-left: 1; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, controller: str, mapping_count: int):
+        super().__init__()
+        self.controller = controller
+        self.mapping_count = mapping_count
+
+    def compose(self) -> ComposeResult:
+        noun = "mapping" if self.mapping_count == 1 else "mappings"
+        with Vertical(id="reset-dialog"):
+            yield Label("Reset mappings?", id="reset-title")
+            yield Static(
+                f"Clear all {self.mapping_count} {noun} for {self.controller}? "
+                "This takes effect when you save.",
+                id="reset-message",
+            )
+            with Horizontal(id="reset-dialog-actions"):
+                yield Button("Cancel", id="reset-cancel")
+                yield Button("Reset mappings", id="reset-confirm", variant="error")
+
+    @on(Button.Pressed, "#reset-cancel")
+    def cancel_pressed(self) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed, "#reset-confirm")
+    def confirm_pressed(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class ConfigureApp(App[dict]):
     """Interactive, non-linear mapping editor."""
 
@@ -238,8 +285,9 @@ class ConfigureApp(App[dict]):
     #empty-help { height: 3; padding: 1; color: #71849e; }
     #mapping-actions, #assignment-actions { height: 3; padding: 0 1; }
     #mapping-actions Button, #assignment-actions Button { margin-right: 1; }
-    #learn { width: 24; background: #275f9f; }
-    #delete { width: 18; background: #713641; }
+    #learn { width: 1fr; background: #275f9f; }
+    #delete { width: 1fr; background: #713641; }
+    #reset-mappings { width: 1fr; background: #713641; }
     #search { margin: 0 1 1 1; }
     #targets { height: 1fr; margin: 0 1; border: tall #1d2b3e; }
     #selection { height: 4; padding: 1 2; color: #aebdd0; }
@@ -291,6 +339,7 @@ class ConfigureApp(App[dict]):
                 with Horizontal(id="mapping-actions"):
                     yield Button("Listen for control", id="learn", variant="primary")
                     yield Button("Delete selected", id="delete", variant="error")
+                    yield Button("Reset mappings", id="reset-mappings", variant="error")
             with Vertical(classes="panel", id="target-panel"):
                 yield Label("LIGHTROOM TARGETS", classes="panel-title")
                 yield Input(
@@ -573,6 +622,29 @@ class ConfigureApp(App[dict]):
     @on(Button.Pressed, "#delete")
     def delete_pressed(self) -> None:
         self.action_delete_mapping()
+
+    @on(Button.Pressed, "#reset-mappings")
+    def reset_pressed(self) -> None:
+        count = len(mappings_for(self.config))
+        if not count:
+            self.notify("This controller has no mappings", severity="warning")
+            return
+        controller = str(self.config.get("midi_port") or "this controller")
+        self.push_screen(
+            ConfirmResetScreen(controller, count),
+            self._finish_reset_mappings,
+        )
+
+    def _finish_reset_mappings(self, confirmed: bool) -> None:
+        if not confirmed:
+            return
+        removed = clear_mappings(self.config)
+        self.pending_event = None
+        self.query_one("#learn", Button).label = "Listen for control"
+        self._refresh_mappings()
+        self._mark_dirty()
+        self._refresh_status("Mappings reset — save to keep this change")
+        self.notify(f"Cleared {removed} mappings")
 
     def action_save(self) -> None:
         save_config(self.config)
