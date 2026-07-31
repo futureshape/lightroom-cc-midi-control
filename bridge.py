@@ -45,6 +45,22 @@ def _parse_midi(msg: list) -> Optional[tuple[str, dict]]:
     return None
 
 
+def _relative_delta(mode: str, value: int) -> Optional[int]:
+    """Decode one relative encoder message, or return None for no movement."""
+    if mode == "relative_cw":
+        # Some controllers label this protocol "CW": 127 increments, 0 decrements.
+        if value == 127:
+            return 1
+        if value == 0:
+            return -1
+        return None
+
+    # Signed-bit: 0 or 64 = idle, 1–63 = CW, 65–127 = CCW.
+    if value == 0 or value == 64:
+        return None
+    return value if value < 64 else value - 128
+
+
 class Bridge:
     """
     Connects one MIDI input port to Lightroom via WebSocket.
@@ -203,11 +219,10 @@ class Bridge:
             if not self._pickup_ready(midi_key, current, value, min_val, max_val):
                 return
 
-        elif mode == "relative":
-            # Signed-bit: 0 or 64 = no movement, 1-63 = CW (+), 65-127 = CCW (-)
-            if cc_raw == 0 or cc_raw == 64:
+        elif mode in ("relative", "relative_cw"):
+            delta = _relative_delta(mode, cc_raw)
+            if delta is None:
                 return
-            delta       = cc_raw if cc_raw < 64 else cc_raw - 128
             sensitivity = float(mapping.get("sensitivity", 1.0))
             step        = delta * sensitivity
 

@@ -96,7 +96,13 @@ The bridge loads `mappings.json`, connects to Lightroom, and translates MIDI mes
 
 **Absolute** — for faders and potentiometers: CC value 0→127 maps linearly across the parameter's full range, with value pickup (soft takeover) so the Lightroom slider does not jump until the hardware control crosses the current Lightroom value.
 
-**Relative** — for endless encoders: uses signed-bit encoding (values 1–63 = clockwise / increase, 65–127 = counter-clockwise / decrease). Most modern encoders (Arturia, Korg nanoKONTROL, Behringer X-TOUCH, etc.) use this encoding. Sensitivity is configurable per control.
+**Relative (signed-bit)** — for endless encoders that send values 1–63 for
+clockwise/increase and 65–127 for counter-clockwise/decrease.
+
+**Relative CW (0/127)** — for endless encoders that send 0 for one step
+counter-clockwise and 127 for one step clockwise.
+
+Sensitivity is configurable per control in either relative mode.
 
 ## How it works
 

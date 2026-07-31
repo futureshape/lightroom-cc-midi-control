@@ -351,7 +351,8 @@ class ConfigureApp(App[dict]):
                 with Horizontal(id="settings"):
                     yield Select(
                         [("Absolute · fader / knob", "absolute"),
-                         ("Relative · endless encoder", "relative")],
+                         ("Relative · signed-bit encoder", "relative"),
+                         ("Relative CW · 0 CCW / 127 CW", "relative_cw")],
                         value="absolute",
                         id="mode",
                     )
