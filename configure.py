@@ -482,6 +482,15 @@ class ConfigureApp(App[dict]):
     def search_changed(self, event: Input.Changed) -> None:
         self._refresh_targets(event.value)
 
+    @on(Input.Submitted, "#search")
+    def search_submitted(self, event: Input.Submitted) -> None:
+        if len(self.filtered_choices) != 1:
+            return
+        self._select_choice(0)
+        self.query_one("#targets", OptionList).highlighted = 0
+        if self.pending_event is None:
+            self.action_listen()
+
     @on(OptionList.OptionHighlighted, "#targets")
     def target_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         self._select_choice(event.option_index)
