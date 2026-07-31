@@ -317,6 +317,7 @@ class ConfigureApp(App[dict]):
         self.filtered_choices: list[dict] = []
         self.selected_choice: Optional[dict] = None
         self.pending_event: Optional[dict] = None
+        self.editing_index: Optional[int] = None
         self.watcher: Optional[MidiWatcher] = None
         self.lr: Optional[LightroomClient] = None
         self.dirty = False
@@ -397,7 +398,9 @@ class ConfigureApp(App[dict]):
         mappings_for(self.config, port)
         self._close_watcher()
         self.pending_event = None
+        self.editing_index = None
         self.query_one("#learn", Button).label = "Listen for control"
+        self.query_one("#assign", Button).label = "Assign mapping"
         self._refresh_mappings()
         self._mark_dirty()
         return True
@@ -441,7 +444,8 @@ class ConfigureApp(App[dict]):
         target_list.clear_options()
         target_list.add_options(options)
         if options:
-            target_list.highlighted = 0
+            with target_list.prevent(OptionList.OptionHighlighted):
+                target_list.highlighted = 0
             self._select_choice(0)
 
     def _select_choice(self, index: int) -> None:
@@ -487,6 +491,68 @@ class ConfigureApp(App[dict]):
         self._select_choice(event.option_index)
         if self.pending_event is None:
             self.action_listen()
+
+    @on(DataTable.RowSelected, "#mapping-table")
+    def mapping_selected(self, event: DataTable.RowSelected) -> None:
+        index = int(str(event.row_key.value))
+        mappings = mappings_for(self.config)
+        if not 0 <= index < len(mappings):
+            return
+        mapping = mappings[index]
+        target_field = "parameter" if mapping.get("action_type") == "setValue" else "action"
+        target = mapping.get(target_field)
+        choice = next(
+            (
+                item for item in self.choices
+                if item["mapping"].get(target_field) == target
+            ),
+            None,
+        )
+        if choice is None:
+            self.notify("This mapping's Lightroom target is no longer available", severity="error")
+            return
+
+        search = self.query_one("#search", Input)
+        # We refresh the exact target below; suppress the queued search event so
+        # it cannot subsequently overwrite the mapping's saved settings.
+        with search.prevent(Input.Changed):
+            search.value = choice["label"]
+        self._refresh_targets(choice["label"])
+        choice_index = next(
+            (i for i, item in enumerate(self.filtered_choices) if item is choice),
+            0,
+        )
+        target_list = self.query_one("#targets", OptionList)
+        with target_list.prevent(OptionList.OptionHighlighted):
+            target_list.highlighted = choice_index
+        self._select_choice(choice_index)
+
+        if mapping.get("action_type") == "setValue":
+            mode = mapping.get("mode", "absolute")
+            self.query_one("#mode", Select).value = mode
+            self.query_one("#sensitivity", Input).value = str(
+                mapping.get("sensitivity", choice["mapping"].get("sensitivity", 1.0))
+            )
+
+        self.pending_event = self._event_from_mapping(mapping)
+        self.editing_index = index
+        self.query_one("#learn", Button).label = (
+            f"Control: {mapping.get('midi_desc', mapping.get('midi_key', '?'))}"
+        )
+        self.query_one("#assign", Button).label = "Save changes"
+        self._refresh_status("Editing selected mapping")
+
+    @staticmethod
+    def _event_from_mapping(mapping: dict) -> dict:
+        event_type = mapping.get("midi_type", "cc" if "cc" in mapping else "note_on")
+        event = {"type": event_type, "channel": int(mapping.get("channel", 1))}
+        if event_type == "cc":
+            event.update(cc=int(mapping["cc"]), value=0)
+        elif event_type in ("note_on", "note_off"):
+            event.update(note=int(mapping["note"]), velocity=127)
+        elif event_type == "pitch_bend":
+            event["value"] = 0
+        return event
 
     @on(Button.Pressed, "#refresh")
     def refresh_pressed(self) -> None:
@@ -600,13 +666,25 @@ class ConfigureApp(App[dict]):
         elif event["type"] == "note_on":
             mapping["note"] = event["note"]
         mappings = mappings_for(self.config)
-        mappings[:] = [item for item in mappings if item.get("midi_key") != key]
-        mappings.append(mapping)
+        editing = self.editing_index
+        if editing is not None and 0 <= editing < len(mappings):
+            mappings[:] = [
+                mapping if index == editing else item
+                for index, item in enumerate(mappings)
+                if index == editing or item.get("midi_key") != key
+            ]
+            status = "Mapping updated"
+        else:
+            mappings[:] = [item for item in mappings if item.get("midi_key") != key]
+            mappings.append(mapping)
+            status = "Mapping added"
         self.pending_event = None
+        self.editing_index = None
         self.query_one("#learn", Button).label = "Listen for control"
+        self.query_one("#assign", Button).label = "Assign mapping"
         self._refresh_mappings()
         self._mark_dirty()
-        self._refresh_status("Mapping added")
+        self._refresh_status(status)
         self.notify(f"{mapping['midi_desc']} → {mapping['label']}")
 
     def action_delete_mapping(self) -> None:
@@ -616,6 +694,10 @@ class ConfigureApp(App[dict]):
         row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
         index = int(str(row_key.value))
         removed = mappings_for(self.config).pop(index)
+        self.pending_event = None
+        self.editing_index = None
+        self.query_one("#learn", Button).label = "Listen for control"
+        self.query_one("#assign", Button).label = "Assign mapping"
         self._refresh_mappings()
         self._mark_dirty()
         self.notify(f"Removed {removed.get('label', 'mapping')}")
@@ -641,7 +723,9 @@ class ConfigureApp(App[dict]):
             return
         removed = clear_mappings(self.config)
         self.pending_event = None
+        self.editing_index = None
         self.query_one("#learn", Button).label = "Listen for control"
+        self.query_one("#assign", Button).label = "Assign mapping"
         self._refresh_mappings()
         self._mark_dirty()
         self._refresh_status("Mappings reset — save to keep this change")
