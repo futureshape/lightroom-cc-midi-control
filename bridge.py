@@ -5,8 +5,6 @@ Loads mappings.json written by configure.py.
 from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
 from typing import Optional
 
 import rtmidi
@@ -14,15 +12,9 @@ from rich.console import Console
 from rich.panel import Panel
 
 from lr_client import CONNECTIONS_FILE, LightroomClient
+from config_store import load_config, mappings_for
 
-MAPPINGS_FILE = Path("mappings.json")
 console = Console()
-
-
-def load_config() -> Optional[dict]:
-    if not MAPPINGS_FILE.exists():
-        return None
-    return json.loads(MAPPINGS_FILE.read_text())
 
 
 def _parse_midi(msg: list) -> Optional[tuple[str, dict]]:
@@ -73,8 +65,9 @@ class Bridge:
         self._queue:    asyncio.Queue              = None
         self._loop:     asyncio.AbstractEventLoop  = None
         # Fast lookup: midi_key → mapping dict
+        self._mappings = mappings_for(config)
         self._index:    dict[str, dict] = {
-            m["midi_key"]: m for m in config.get("mappings", [])
+            m["midi_key"]: m for m in self._mappings
         }
         # Cache of current LR parameter values (kept fresh via observer).
         self._lr_cache: dict[str, float] = {}
@@ -271,10 +264,10 @@ class Bridge:
         # Open MIDI
         port_name = self._open_midi()
 
-        n = len(self._config.get("mappings", []))
+        n = len(self._mappings)
         names = ", ".join(
             m.get("label", m.get("action", "?"))
-            for m in self._config.get("mappings", [])[:6]
+            for m in self._mappings[:6]
         )
         if n > 6:
             names += "…"
@@ -316,7 +309,7 @@ async def run_bridge(lr_port: Optional[int] = None):
         return
 
     config = load_config()
-    if config is None or not config.get("mappings"):
+    if config is None or not mappings_for(config):
         console.print(
             "[yellow]No mappings found.[/yellow]  "
             "Run [bold]python main.py --configure[/bold] first."

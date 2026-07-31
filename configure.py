@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
 from typing import Optional
 
 import rtmidi
@@ -26,18 +24,7 @@ from textual.widgets.option_list import Option
 
 from lr_client import LightroomClient
 from params import ACTIONS, PARAMETERS
-
-MAPPINGS_FILE = Path("mappings.json")
-
-
-def load_config() -> dict:
-    if MAPPINGS_FILE.exists():
-        return json.loads(MAPPINGS_FILE.read_text())
-    return {"midi_port": None, "client_guid": None, "mappings": []}
-
-
-def save_config(config: dict) -> None:
-    MAPPINGS_FILE.write_text(json.dumps(config, indent=2) + "\n")
+from config_store import empty_config, load_config, mappings_for, save_config
 
 
 def _midi_key(event: dict) -> str:
@@ -277,7 +264,7 @@ class ConfigureApp(App[dict]):
     def __init__(self, lr_port: Optional[int] = None):
         super().__init__()
         self.lr_port = lr_port
-        self.config = load_config()
+        self.config = load_config() or empty_config()
         self.choices = _mapping_choices()
         self.filtered_choices: list[dict] = []
         self.selected_choice: Optional[dict] = None
@@ -348,9 +335,22 @@ class ConfigureApp(App[dict]):
         if current in ports:
             select.value = current
         elif ports:
+            self._activate_port(ports[0])
             select.value = ports[0]
-            self.config["midi_port"] = ports[0]
         self._refresh_status()
+
+    def _activate_port(self, port: str) -> bool:
+        """Switch to a controller and its independent mapping profile."""
+        if port == self.config.get("midi_port"):
+            return False
+        self.config["midi_port"] = port
+        mappings_for(self.config, port)
+        self._close_watcher()
+        self.pending_event = None
+        self.query_one("#learn", Button).label = "Listen for control"
+        self._refresh_mappings()
+        self._mark_dirty()
+        return True
 
     def _refresh_status(self, message: Optional[str] = None) -> None:
         port = self.config.get("midi_port")
@@ -366,14 +366,15 @@ class ConfigureApp(App[dict]):
     def _refresh_mappings(self) -> None:
         table = self.query_one("#mapping-table", DataTable)
         table.clear()
-        for index, mapping in enumerate(self.config.get("mappings", [])):
+        mappings = mappings_for(self.config)
+        for index, mapping in enumerate(mappings):
             table.add_row(
                 mapping.get("midi_desc", mapping.get("midi_key", "?")),
                 mapping.get("label", mapping.get("action", "?")),
                 mapping.get("mode", "Action").title(),
                 key=str(index),
             )
-        self.query_one("#empty-help").display = not bool(self.config.get("mappings"))
+        self.query_one("#empty-help").display = not bool(mappings)
 
     def _refresh_targets(self, query: str) -> None:
         self.filtered_choices = _match_choices(query, self.choices)
@@ -420,10 +421,7 @@ class ConfigureApp(App[dict]):
         if event.value is Select.BLANK:
             return
         port = str(event.value)
-        if port != self.config.get("midi_port"):
-            self.config["midi_port"] = port
-            self._close_watcher()
-            self._mark_dirty()
+        self._activate_port(port)
         self._refresh_status()
 
     @on(Input.Changed, "#search")
@@ -551,7 +549,7 @@ class ConfigureApp(App[dict]):
             mapping["cc"] = event["cc"]
         elif event["type"] == "note_on":
             mapping["note"] = event["note"]
-        mappings = self.config.setdefault("mappings", [])
+        mappings = mappings_for(self.config)
         mappings[:] = [item for item in mappings if item.get("midi_key") != key]
         mappings.append(mapping)
         self.pending_event = None
@@ -567,7 +565,7 @@ class ConfigureApp(App[dict]):
             return
         row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
         index = int(str(row_key.value))
-        removed = self.config["mappings"].pop(index)
+        removed = mappings_for(self.config).pop(index)
         self._refresh_mappings()
         self._mark_dirty()
         self.notify(f"Removed {removed.get('label', 'mapping')}")
@@ -580,7 +578,7 @@ class ConfigureApp(App[dict]):
         save_config(self.config)
         self.dirty = False
         self.query_one("#dirty", Static).update("Saved")
-        self.notify(f"Saved {len(self.config.get('mappings', []))} mappings")
+        self.notify(f"Saved {len(mappings_for(self.config))} mappings")
 
     @on(Button.Pressed, "#save")
     def save_pressed(self) -> None:

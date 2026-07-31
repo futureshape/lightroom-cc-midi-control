@@ -52,7 +52,9 @@ The setup app gives you a persistent workspace where you can:
 Use **Ctrl+S** to save, **Ctrl+L** to listen for a control, and **Q** to save and
 quit. You can also use the on-screen buttons throughout.
 
-Mappings are saved to `mappings.json` in the project folder.
+Mappings are saved to `mappings.json` in the project folder. Each MIDI input has
+its own mapping profile: selecting a new controller starts with a blank mapping
+list, and switching back restores that controller's mappings.
 
 ### 2 — Run the bridge
 
